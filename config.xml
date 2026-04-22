@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<config>
+	<device>
+		<mouse name="M3" device_type="101" device_attr="Keychron-m3">
+			<mode value="0" desc="USB" vid="3434" pid="D032" hid_interface="VID_3434&PID_D032&MI_02"/>
+			<mode value="0" desc="USB" vid="3434" pid="D033" hid_interface="VID_3434&PID_D033&MI_02"/>
+			<mode value="1" desc="2.4G TYPE-C" vid="3434" pid="D031" hid_interface="VID_3434&PID_D031&MI_01"/>
+			<mode value="3" desc="2.4G TYPE-A" vid="3434" pid="D030" hid_interface="VID_3434&PID_D030&MI_01"/>
+			<mode value="2" desc="Bluetooth"   vid="3434" pid="D033" hid_interface="VID&023434_PID&D032"/>
+			<mode value="2" desc="Bluetooth"   vid="3434" pid="D033" hid_interface="VID&023434_PID&D033"/>
+		</mouse>
+		<mouse name="M1" device_type="102" device_attr="Keychron-m1">
+			<mode value="0" desc="USB" vid="3434" pid="D035" hid_interface="VID_3434&PID_D035&MI_02"/>
+			<mode value="1" desc="2.4G TYPE-C" vid="3434" pid="D031" hid_interface="VID_3434&PID_D031&MI_01"/>
+			<mode value="3" desc="2.4G TYPE-A" vid="3434" pid="D030" hid_interface="VID_3434&PID_D030&MI_01"/>
+			<mode value="2" desc="Bluetooth"   vid="3434" pid="D035" hid_interface="VID&023434_PID&D035"/>
+		</mouse>
+		<mouse name="M3 mini" device_type="103" device_attr="Keychron-m3mini">
+			<mode value="0" desc="USB" vid="3434" pid="D036" hid_interface="VID_3434&PID_D036&MI_02"/>
+			<mode value="1" desc="2.4G TYPE-C" vid="3434" pid="D031" hid_interface="VID_3434&PID_D031&MI_01"/>
+			<mode value="3" desc="2.4G TYPE-A" vid="3434" pid="D030" hid_interface="VID_3434&PID_D030&MI_01"/>
+			<mode value="2" desc="Bluetooth"   vid="3434" pid="D036" hid_interface="VID&023434_PID&D036"/>
+		</mouse>
+		<mouse name="M2" device_type="105" device_attr="Keychron-m2">
+			<mode value="0" desc="USB" vid="3434" pid="D03B" hid_interface="VID_3434&PID_D03B&MI_02"/>
+			<mode value="1" desc="2.4G TYPE-C" vid="3434" pid="D031" hid_interface="VID_3434&PID_D031&MI_01"/>
+			<mode value="3" desc="2.4G TYPE-A" vid="3434" pid="D030" hid_interface="VID_3434&PID_D030&MI_01"/>
+			<mode value="2" desc="Bluetooth"   vid="3434" pid="D03B" hid_interface="VID&023434_PID&D03B"/>
+		</mouse>
+		<mouse name="M3 mini" device_type="106" device_attr="Keychron-m3mini2">
+			<mode value="0" desc="USB" vid="3434" pid="D03E" hid_interface="VID_3434&PID_D03E&MI_02"/>
+			<mode value="1" desc="2.4G TYPE-C" vid="3434" pid="D031" hid_interface="VID_3434&PID_D031&MI_01"/>
+			<mode value="3" desc="2.4G TYPE-A" vid="3434" pid="D030" hid_interface="VID_3434&PID_D030&MI_01"/>
+			<mode value="2" desc="Bluetooth"   vid="3434" pid="D03E" hid_interface="VID&023434_PID&D03E"/>
+		</mouse>
+		<mouse name="M2 mini" device_type="122" device_attr="Keychron-m2mini">
+			<mode value="0" desc="USB" vid="3434" pid="D03D" hid_interface="VID_3434&PID_D03D&MI_02"/>
+			<mode value="1" desc="2.4G TYPE-C" vid="3434" pid="D031" hid_interface="VID_3434&PID_D031&MI_01"/>
+			<mode value="3" desc="2.4G TYPE-A" vid="3434" pid="D030" hid_interface="VID_3434&PID_D030&MI_01"/>
+			<mode value="2" desc="Bluetooth"   vid="3434" pid="D03D" hid_interface="VID&023434_PID&D03D"/>
+		</mouse>
+		<mouse name="M6" device_type="160" device_attr="Keychron-m6">
+			<mode value="0" desc="USB" vid="3434" pid="D03F" hid_interface="VID_3434&PID_D03F&MI_02"/>
+			<mode value="1" desc="2.4G TYPE-C" vid="3434" pid="D031" hid_interface="VID_3434&PID_D031&MI_01"/>
+			<mode value="3" desc="2.4G TYPE-A" vid="3434" pid="D030" hid_interface="VID_3434&PID_D030&MI_01"/>
+			<mode value="2" desc="Bluetooth"   vid="3434" pid="D03F" hid_interface="VID&023434_PID&D03F"/>
+		</mouse>
+		<mouse name="M7" device_type="170" device_attr="Keychron-m7">
+			<mode value="0" desc="USB" vid="3434" pid="D044" hid_interface="VID_3434&PID_D044&MI_02"/>
+			<mode value="1" desc="2.4G TYPE-C" vid="3434" pid="D031" hid_interface="VID_3434&PID_D031&MI_01"/>
+			<mode value="3" desc="2.4G TYPE-A" vid="3434" pid="D030" hid_interface="VID_3434&PID_D030&MI_01"/>
+			<mode value="2" desc="Bluetooth"   vid="3434" pid="D044" hid_interface="VID&023434_PID&D044"/>
+		</mouse>
+		<mouse name="M3 mini 4K" device_type="201" device_attr="Keychron-m3mini4k">
+			<mode value="0" desc="USB" vid="3434" pid="D037" hid_interface="VID_3434&PID_D037&MI_03"/>
+			<mode value="1" desc="2.4G TYPE-C" vid="3434" pid="D038" hid_interface="VID_3434&PID_D038&MI_03"/>
+			<mode value="2" desc="Bluetooth"   vid="3434" pid="D037" hid_interface="VID&023434_PID&D037"/>
+		</mouse>
+		<mouse name="M3 4K" device_type="202" device_attr="Keychron-m34k">
+			<mode value="0" desc="USB" vid="3434" pid="D03C" hid_interface="VID_3434&PID_D03C&MI_03"/>
+			<mode value="1" desc="2.4G TYPE-C" vid="3434" pid="D038" hid_interface="VID_3434&PID_D038&MI_03"/>
+			<mode value="2" desc="Bluetooth"   vid="3434" pid="D03C" hid_interface="VID&023434_PID&D03C"/>
+		</mouse>
+		<mouse name="M3 mini 4K" device_type="203" device_attr="Keychron-m3mini4k2">
+			<mode value="0" desc="USB" vid="3434" pid="D041" hid_interface="VID_3434&PID_D041&MI_03"/>
+			<mode value="1" desc="2.4G TYPE-C" vid="3434" pid="D038" hid_interface="VID_3434&PID_D038&MI_03"/>
+			<mode value="2" desc="Bluetooth"   vid="3434" pid="D041" hid_interface="VID&023434_PID&D041"/>
+		</mouse>
+		<mouse name="M2 4K" device_type="205" device_attr="Keychron-m24k">
+			<mode value="0" desc="USB" vid="3434" pid="D045" hid_interface="VID_3434&PID_D045&MI_03"/>
+			<mode value="1" desc="2.4G TYPE-C" vid="3434" pid="D038" hid_interface="VID_3434&PID_D038&MI_03"/>
+			<mode value="3" desc="2.4G TYPE-A" vid="3434" pid="D043" hid_interface="VID_3434&PID_D043&MI_03"/>
+			<mode value="2" desc="Bluetooth"   vid="3434" pid="D045" hid_interface="VID&023434_PID&D045"/>
+		</mouse>
+		<mouse name="M6 4K" device_type="206" device_attr="Keychron-m64k">
+			<mode value="0" desc="USB" vid="3434" pid="D046" hid_interface="VID_3434&PID_D046&MI_03"/>
+			<mode value="1" desc="2.4G TYPE-C" vid="3434" pid="D038" hid_interface="VID_3434&PID_D038&MI_03"/>
+			<mode value="3" desc="2.4G TYPE-A" vid="3434" pid="D043" hid_interface="VID_3434&PID_D043&MI_03"/>
+			<mode value="2" desc="Bluetooth"   vid="3434" pid="D046" hid_interface="VID&023434_PID&D046"/>
+		</mouse>
+		<mouse name="M4" device_type="231" device_attr="Keychron-m4_4k">
+			<mode value="0" desc="USB" vid="3434" pid="D040" hid_interface="VID_3434&PID_D040&MI_03"/>
+			<mode value="1" desc="2.4G TYPE-C" vid="3434" pid="D038" hid_interface="VID_3434&PID_D038&MI_03"/>
+			<mode value="3" desc="2.4G TYPE-A" vid="3434" pid="D043" hid_interface="VID_3434&PID_D043&MI_03"/>
+			<mode value="2" desc="Bluetooth"   vid="3434" pid="D040" hid_interface="VID&023434_PID&D040"/>
+		</mouse>
+	</device>
+	<software caption="Keychron" version="1.2.1.2">
+		<website url="https://www.keychron.com/"/>
+		<store url="https://www.keychron.com/"/>
+		<upgrade url=""/>
+		<copyright info="Copyright ©2023 Keychron"/>
+	</software>
+</config>
