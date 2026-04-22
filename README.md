@@ -57,3 +57,7 @@ make
   开启当前用户开机启动
 - `--autostart-off`
   关闭当前用户开机启动
+
+
+
+![](assets/运行截图.png)
