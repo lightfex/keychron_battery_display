@@ -34,6 +34,11 @@ make
 .\keychron_battery_display.exe
 ```
 
+启动后右键任务栏图标，可以选择：
+
+- `开机启动`
+  前面有勾表示已启用；无勾且灰色文字表示未启用
+
 启动控制台探针模式：
 
 ```powershell
@@ -48,3 +53,7 @@ make
   指定配置文件路径
 - `--probe`
   进入控制台输出模式
+- `--autostart-on`
+  开启当前用户开机启动
+- `--autostart-off`
+  关闭当前用户开机启动

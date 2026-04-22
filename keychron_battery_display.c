@@ -24,7 +24,13 @@
 #define TIMER_ID_REFRESH 1001
 #define MENU_ID_REFRESH 40001
 #define MENU_ID_EXIT 40002
+#define MENU_ID_AUTOSTART_TOGGLE 40003
 #define DEFAULT_REFRESH_MS 10000
+
+#define RUN_KEY_PATH L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define RUN_VALUE_NAME L"KeychronBatteryDisplayDirectHid"
+
+static const wchar_t *AUTOSTART_MENU_TEXT = L"开机启动";
 
 typedef struct KnownInterface {
     wchar_t hid_interface[128];
@@ -59,6 +65,7 @@ typedef struct AppState {
     BatteryState battery;
     wchar_t config_path[MAX_PATH];
     wchar_t status_text[256];
+    BOOL autostart_enabled;
 } AppState;
 
 static void copy_wstr(wchar_t *dst, size_t dst_count, const wchar_t *src) {
@@ -137,6 +144,156 @@ static bool find_adjacent_config(wchar_t *out, size_t out_count) {
 
     DWORD attr = GetFileAttributesW(out);
     return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static bool get_module_path(wchar_t *out, size_t out_count) {
+    DWORD len = GetModuleFileNameW(NULL, out, (DWORD)out_count);
+    if (len == 0 || len >= out_count) {
+        if (out_count > 0) {
+            out[0] = L'\0';
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool is_autostart_enabled(void) {
+    HKEY key = NULL;
+    LONG rc = RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY_PATH, 0, KEY_QUERY_VALUE, &key);
+    if (rc != ERROR_SUCCESS) {
+        return false;
+    }
+
+    DWORD type = 0;
+    wchar_t value[1024];
+    DWORD size = sizeof(value);
+    rc = RegQueryValueExW(key, RUN_VALUE_NAME, NULL, &type, (LPBYTE)value, &size);
+    RegCloseKey(key);
+    return rc == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ);
+}
+
+static bool set_autostart_enabled(bool enabled) {
+    if (!enabled) {
+        HKEY key = NULL;
+        LONG rc = RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY_PATH, 0, KEY_SET_VALUE, &key);
+        if (rc != ERROR_SUCCESS) {
+            return false;
+        }
+        rc = RegDeleteValueW(key, RUN_VALUE_NAME);
+        RegCloseKey(key);
+        return rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND;
+    }
+
+    wchar_t module_path[MAX_PATH];
+    wchar_t command[2 * MAX_PATH];
+    if (!get_module_path(module_path, ARRAYSIZE(module_path))) {
+        return false;
+    }
+
+    _snwprintf(command, ARRAYSIZE(command) - 1, L"\"%ls\"", module_path);
+    command[ARRAYSIZE(command) - 1] = L'\0';
+
+    HKEY key = NULL;
+    LONG rc = RegCreateKeyExW(
+        HKEY_CURRENT_USER,
+        RUN_KEY_PATH,
+        0,
+        NULL,
+        0,
+        KEY_SET_VALUE,
+        NULL,
+        &key,
+        NULL);
+    if (rc != ERROR_SUCCESS) {
+        return false;
+    }
+
+    rc = RegSetValueExW(
+        key,
+        RUN_VALUE_NAME,
+        0,
+        REG_SZ,
+        (const BYTE *)command,
+        (DWORD)((wcslen(command) + 1) * sizeof(wchar_t)));
+    RegCloseKey(key);
+    return rc == ERROR_SUCCESS;
+}
+
+static HFONT create_menu_font(void) {
+    NONCLIENTMETRICSW ncm;
+    ZeroMemory(&ncm, sizeof(ncm));
+    ncm.cbSize = sizeof(ncm);
+    if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0)) {
+        return CreateFontIndirectW(&ncm.lfMenuFont);
+    }
+    return (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+}
+
+static void measure_autostart_menu_item(MEASUREITEMSTRUCT *mis) {
+    HDC dc = GetDC(NULL);
+    HFONT font = create_menu_font();
+    HGDIOBJ old_font = SelectObject(dc, font);
+    SIZE size = {0};
+
+    GetTextExtentPoint32W(dc, AUTOSTART_MENU_TEXT, (int)wcslen(AUTOSTART_MENU_TEXT), &size);
+    mis->itemWidth = (UINT)(size.cx + 44);
+    mis->itemHeight = (UINT)max(size.cy + 8, 24);
+
+    SelectObject(dc, old_font);
+    if (font && font != GetStockObject(DEFAULT_GUI_FONT)) {
+        DeleteObject(font);
+    }
+    ReleaseDC(NULL, dc);
+}
+
+static void draw_autostart_menu_item(HWND hwnd, const DRAWITEMSTRUCT *dis) {
+    AppState *app = (AppState *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    RECT rc = dis->rcItem;
+    HDC dc = dis->hDC;
+    BOOL selected = (dis->itemState & ODS_SELECTED) != 0;
+    BOOL enabled = app ? app->autostart_enabled : FALSE;
+
+    COLORREF bg = GetSysColor(selected ? COLOR_HIGHLIGHT : COLOR_MENU);
+    COLORREF text_color;
+    if (selected) {
+        text_color = GetSysColor(COLOR_HIGHLIGHTTEXT);
+    } else if (enabled) {
+        text_color = GetSysColor(COLOR_MENUTEXT);
+    } else {
+        text_color = RGB(140, 140, 140);
+    }
+
+    HBRUSH bg_brush = CreateSolidBrush(bg);
+    FillRect(dc, &rc, bg_brush);
+    DeleteObject(bg_brush);
+
+    RECT check_rc = rc;
+    check_rc.right = check_rc.left + 20;
+    RECT text_rc = rc;
+    text_rc.left += 26;
+
+    if (enabled) {
+        RECT glyph = check_rc;
+        glyph.left += 2;
+        glyph.top += 4;
+        glyph.right -= 2;
+        glyph.bottom -= 4;
+        DrawFrameControl(dc, &glyph, DFC_MENU, DFCS_MENUCHECK);
+    }
+
+    HFONT font = create_menu_font();
+    HGDIOBJ old_font = SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, text_color);
+    DrawTextW(dc, AUTOSTART_MENU_TEXT, -1, &text_rc, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+    SelectObject(dc, old_font);
+    if (font && font != GetStockObject(DEFAULT_GUI_FONT)) {
+        DeleteObject(font);
+    }
+
+    if ((dis->itemState & ODS_FOCUS) != 0) {
+        DrawFocusRect(dc, &rc);
+    }
 }
 
 static size_t load_known_interfaces(const wchar_t *config_path, KnownInterface *items, size_t capacity) {
@@ -574,6 +731,8 @@ static void refresh_state(AppState *app) {
         copy_wstr(app->status_text, ARRAYSIZE(app->status_text), status);
     }
 
+    app->autostart_enabled = is_autostart_enabled();
+
     update_tray_icon(app);
 }
 
@@ -602,6 +761,9 @@ static void show_context_menu(AppState *app) {
             app->battery.charging);
         AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, line);
     }
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    app->autostart_enabled = is_autostart_enabled();
+    AppendMenuW(menu, MF_OWNERDRAW, MENU_ID_AUTOSTART_TOGGLE, AUTOSTART_MENU_TEXT);
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
     AppendMenuW(menu, MF_STRING, MENU_ID_REFRESH, L"立即刷新");
     AppendMenuW(menu, MF_STRING, MENU_ID_EXIT, L"退出");
@@ -636,6 +798,12 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                 return 0;
             }
             switch (LOWORD(wparam)) {
+                case MENU_ID_AUTOSTART_TOGGLE:
+                    if (set_autostart_enabled(app->autostart_enabled ? false : true)) {
+                        app->autostart_enabled = app->autostart_enabled ? FALSE : TRUE;
+                    }
+                    refresh_state(app);
+                    return 0;
                 case MENU_ID_REFRESH:
                     refresh_state(app);
                     return 0;
@@ -658,6 +826,22 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                 return 0;
             }
             return 0;
+        case WM_MEASUREITEM: {
+            MEASUREITEMSTRUCT *mis = (MEASUREITEMSTRUCT *)lparam;
+            if (mis && mis->CtlType == ODT_MENU && mis->itemID == MENU_ID_AUTOSTART_TOGGLE) {
+                measure_autostart_menu_item(mis);
+                return TRUE;
+            }
+            break;
+        }
+        case WM_DRAWITEM: {
+            DRAWITEMSTRUCT *dis = (DRAWITEMSTRUCT *)lparam;
+            if (dis && dis->CtlType == ODT_MENU && dis->itemID == MENU_ID_AUTOSTART_TOGGLE) {
+                draw_autostart_menu_item(hwnd, dis);
+                return TRUE;
+            }
+            break;
+        }
         case WM_DESTROY:
             if (app) {
                 KillTimer(hwnd, TIMER_ID_REFRESH);
@@ -812,6 +996,18 @@ static bool has_console_mode_arg(int argc, wchar_t **argv) {
     return false;
 }
 
+static int get_autostart_mode_arg(int argc, wchar_t **argv) {
+    for (int i = 1; i < argc; ++i) {
+        if (_wcsicmp(argv[i], L"--autostart-on") == 0) {
+            return 1;
+        }
+        if (_wcsicmp(argv[i], L"--autostart-off") == 0) {
+            return 0;
+        }
+    }
+    return -1;
+}
+
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev_instance, PWSTR cmdline, int show_cmd) {
     (void)prev_instance;
     (void)cmdline;
@@ -820,8 +1016,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev_instance, PWSTR cmdline, 
     int argc = 0;
     wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     int rc = 0;
+    int autostart_mode = get_autostart_mode_arg(argc, argv);
 
-    if (has_console_mode_arg(argc, argv)) {
+    if (autostart_mode != -1) {
+        enable_console_io();
+        if (set_autostart_enabled(autostart_mode == 1)) {
+            wprintf(L"autostart=%ls\n", autostart_mode == 1 ? L"enabled" : L"disabled");
+            rc = 0;
+        } else {
+            fwprintf(stderr, L"autostart update failed\n");
+            rc = 1;
+        }
+    } else if (has_console_mode_arg(argc, argv)) {
         enable_console_io();
         rc = run_console_probe(argc, argv);
     } else {
