@@ -505,7 +505,11 @@ static bool get_feature_report_timeout(HANDLE handle, uint8_t *buf, DWORD len, D
     return ok ? true : false;
 }
 
-static bool query_endpoint_battery(const Endpoint *ep, BatteryState *state) {
+static bool query_endpoint_battery(const Endpoint *ep, BatteryState *state, wchar_t *reason, size_t reason_count) {
+    if (reason && reason_count > 0) {
+        reason[0] = L'\0';
+    }
+
     HANDLE handle = CreateFileW(
         ep->path,
         GENERIC_READ | GENERIC_WRITE,
@@ -515,46 +519,155 @@ static bool query_endpoint_battery(const Endpoint *ep, BatteryState *state) {
         FILE_FLAG_OVERLAPPED,
         NULL);
     if (handle == INVALID_HANDLE_VALUE) {
+        if (reason && reason_count > 0) {
+            format_wstr(reason, reason_count, L"CreateFile failed (GLE=%lu)", GetLastError());
+        }
         return false;
     }
 
-    uint8_t buf[RF_REPORT_LEN] = {0};
-    buf[0] = 0x51;
-    buf[1] = 0x06;
+    size_t len_candidates[3];
+    size_t len_count = 0;
+    len_candidates[len_count++] = RF_REPORT_LEN;
+    if (ep->feature_len >= RF_REPORT_LEN && ep->feature_len <= 256) {
+        len_candidates[len_count++] = ep->feature_len;
+    }
+    if (len_count < ARRAYSIZE(len_candidates)) {
+        len_candidates[len_count++] = 64;
+    }
 
-    BOOL ok = HidD_SetFeature(handle, buf, (ULONG)sizeof(buf));
-    if (!ok) {
+    size_t max_len = 0;
+    for (size_t i = 0; i < len_count; ++i) {
+        if (len_candidates[i] > max_len) {
+            max_len = len_candidates[i];
+        }
+    }
+
+    uint8_t *buf = (uint8_t *)calloc(max_len, 1);
+    if (!buf) {
         CloseHandle(handle);
+        if (reason && reason_count > 0) {
+            copy_wstr(reason, reason_count, L"calloc failed");
+        }
         return false;
     }
+    for (size_t i = 0; i < len_count; ++i) {
+        size_t report_len = len_candidates[i];
+        for (int mode = 0; mode < 2; ++mode) {
+            DWORD set_err = 0;
+            DWORD hid_get_err = 0;
+            DWORD ioctl_err = 0;
+            int cmd_base = (mode == 0) ? 0 : 1;
 
-    ZeroMemory(buf, sizeof(buf));
-    buf[0] = 0x51;
-    buf[1] = 0x06;
-    if (!get_feature_report_timeout(handle, buf, (DWORD)sizeof(buf), 1500)) {
-        CloseHandle(handle);
-        return false;
+            if ((size_t)(cmd_base + 12) >= report_len) {
+                continue;
+            }
+
+            ZeroMemory(buf, report_len);
+            if (cmd_base == 0) {
+                buf[0] = 0x51;
+                buf[1] = 0x06;
+            } else {
+                buf[0] = 0x00;
+                buf[1] = 0x51;
+                buf[2] = 0x06;
+            }
+            if (!HidD_SetFeature(handle, buf, (ULONG)report_len)) {
+                set_err = GetLastError();
+                if (reason && reason_count > 0) {
+                    format_wstr(
+                        reason,
+                        reason_count,
+                        L"HidD_SetFeature failed (GLE=%lu, len=%u, mode=%d)",
+                        set_err,
+                        (unsigned)report_len,
+                        mode);
+                }
+                continue;
+            }
+
+            Sleep(12);
+
+            ZeroMemory(buf, report_len);
+            if (cmd_base == 0) {
+                buf[0] = 0x51;
+                buf[1] = 0x06;
+            } else {
+                buf[0] = 0x00;
+                buf[1] = 0x51;
+                buf[2] = 0x06;
+            }
+            if (!HidD_GetFeature(handle, buf, (ULONG)report_len)) {
+                hid_get_err = GetLastError();
+                ZeroMemory(buf, report_len);
+                if (cmd_base == 0) {
+                    buf[0] = 0x51;
+                    buf[1] = 0x06;
+                } else {
+                    buf[0] = 0x00;
+                    buf[1] = 0x51;
+                    buf[2] = 0x06;
+                }
+                if (!get_feature_report_timeout(handle, buf, (DWORD)report_len, 1500)) {
+                    ioctl_err = GetLastError();
+                    if (reason && reason_count > 0) {
+                        format_wstr(
+                            reason,
+                            reason_count,
+                            L"GetFeature failed (HidD GLE=%lu, IOCTL GLE=%lu, len=%u, mode=%d)",
+                            hid_get_err,
+                            ioctl_err,
+                            (unsigned)report_len,
+                            mode);
+                    }
+                    continue;
+                }
+            }
+
+            int data_base = -1;
+            if (report_len > 12 && buf[0] == 0x51 && buf[1] == 0x06) {
+                data_base = 0;
+            } else if (report_len > 13 && buf[1] == 0x51 && buf[2] == 0x06) {
+                data_base = 1;
+            }
+
+            if (data_base < 0 || buf[data_base + 11] > 100) {
+                if (reason && reason_count > 0) {
+                    format_wstr(
+                        reason,
+                        reason_count,
+                        L"unexpected report: len=%u mode=%d h=%02X %02X %02X",
+                        (unsigned)report_len,
+                        mode,
+                        (unsigned)buf[0],
+                        (unsigned)(report_len > 1 ? buf[1] : 0),
+                        (unsigned)(report_len > 2 ? buf[2] : 0));
+                }
+                continue;
+            }
+
+            ZeroMemory(state, sizeof(*state));
+            memcpy(state->raw, buf, min((size_t)RF_REPORT_LEN, report_len));
+            state->work_mode = (uint8_t)(buf[data_base + 10] & 0x07);
+            state->connected = (uint8_t)((buf[data_base + 10] >> 3) & 0x01);
+            state->percent = buf[data_base + 11];
+            state->charging = buf[data_base + 12];
+            copy_wstr(state->endpoint_path, ARRAYSIZE(state->endpoint_path), ep->path);
+            free(buf);
+            CloseHandle(handle);
+            return true;
+        }
     }
 
+    free(buf);
     CloseHandle(handle);
-
-    if (buf[0] != 0x51 || buf[1] != 0x06 || buf[11] > 100) {
-        return false;
-    }
-
-    ZeroMemory(state, sizeof(*state));
-    memcpy(state->raw, buf, sizeof(buf));
-    state->work_mode = (uint8_t)(buf[10] & 0x07);
-    state->connected = (uint8_t)((buf[10] >> 3) & 0x01);
-    state->percent = buf[11];
-    state->charging = buf[12];
-    copy_wstr(state->endpoint_path, ARRAYSIZE(state->endpoint_path), ep->path);
-    return true;
+    return false;
 }
 
 static bool query_keychron_battery(const wchar_t *config_path, BatteryState *state, wchar_t *status, size_t status_count) {
     KnownInterface known[64];
     Endpoint endpoints[32];
+    wchar_t last_reason[256];
+    last_reason[0] = L'\0';
 
     size_t known_count = load_known_interfaces(config_path, known, ARRAYSIZE(known));
     size_t endpoint_count = enumerate_endpoints(known, known_count, endpoints, ARRAYSIZE(endpoints));
@@ -564,16 +677,19 @@ static bool query_keychron_battery(const wchar_t *config_path, BatteryState *sta
     }
 
     for (size_t i = 0; i < endpoint_count; ++i) {
-        if (query_endpoint_battery(&endpoints[i], state)) {
+        if (query_endpoint_battery(&endpoints[i], state, last_reason, ARRAYSIZE(last_reason))) {
             format_wstr(status, status_count, L"OK: VID=%04X PID=%04X", endpoints[i].vendor_id, endpoints[i].product_id);
             return true;
         }
     }
 
-    format_wstr(status, status_count, L"找到 HID 接口，但读取 0x51 0x06 电量失败");
+    if (last_reason[0]) {
+        format_wstr(status, status_count, L"找到 HID 接口，但读取 0x51 0x06 失败: %ls", last_reason);
+    } else {
+        format_wstr(status, status_count, L"找到 HID 接口，但读取 0x51 0x06 电量失败");
+    }
     return false;
 }
-
 static COLORREF battery_color(const AppState *app) {
     if (!app || !app->has_battery) {
         return RGB(150, 150, 150);
@@ -1039,3 +1155,4 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev_instance, PWSTR cmdline, 
     }
     return rc;
 }
+
