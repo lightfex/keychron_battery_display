@@ -1,5 +1,6 @@
 #define _WIN32_WINNT 0x0A00
 #include <windows.h>
+#include <dbt.h>
 #include <setupapi.h>
 #include <hidsdi.h>
 #include <shellapi.h>
@@ -21,11 +22,24 @@
 #define RF_REPORT_LEN 21
 
 #define WM_TRAYICON (WM_APP + 1)
+#define WM_REFRESH_COMPLETE (WM_APP + 2)
 #define TIMER_ID_REFRESH 1001
+#define TIMER_ID_STARTUP_REFRESH 1002
+#define TIMER_ID_DEVICECHANGE_REFRESH 1003
+#define TIMER_ID_DEFERRED_REFRESH 1004
 #define MENU_ID_REFRESH 40001
 #define MENU_ID_EXIT 40002
 #define MENU_ID_AUTOSTART_TOGGLE 40003
 #define DEFAULT_REFRESH_MS 10000
+#define STARTUP_REFRESH_DELAY_MS 1500
+#define QUERY_RETRY_COUNT 2
+#define QUERY_RETRY_DELAY_MS 150
+#define OPEN_SETTLE_DELAY_MS 80
+#define FEATURE_EXCHANGE_DELAY_MS 20
+#define FEATURE_POLL_ATTEMPTS 20
+#define FEATURE_POLL_TIMEOUT_MS 30
+#define DEVICECHANGE_REFRESH_DELAY_MS 300
+#define DEFERRED_REFRESH_DELAY_MS 1
 
 #define RUN_KEY_PATH L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 #define RUN_VALUE_NAME L"KeychronBatteryDisplayDirectHid"
@@ -54,9 +68,17 @@ typedef struct BatteryState {
     wchar_t endpoint_path[512];
 } BatteryState;
 
+typedef struct RefreshResult {
+    BOOL success;
+    BatteryState battery;
+    wchar_t status[256];
+    BOOL autostart_enabled;
+} RefreshResult;
+
 typedef struct AppState {
     HINSTANCE instance;
     HWND hwnd;
+    HDEVNOTIFY hid_notify;
     NOTIFYICONDATAW nid;
     BOOL icon_added;
     HICON icon;
@@ -66,6 +88,10 @@ typedef struct AppState {
     wchar_t config_path[MAX_PATH];
     wchar_t status_text[256];
     BOOL autostart_enabled;
+    LONG refresh_in_progress;
+    BOOL refresh_pending;
+    BOOL shutting_down;
+    HANDLE refresh_thread;
 } AppState;
 
 static void copy_wstr(wchar_t *dst, size_t dst_count, const wchar_t *src) {
@@ -505,6 +531,215 @@ static bool get_feature_report_timeout(HANDLE handle, uint8_t *buf, DWORD len, D
     return ok ? true : false;
 }
 
+static bool prepare_feature_command(uint8_t *buf, size_t report_len, int mode, const uint8_t *cmd, size_t cmd_len) {
+    int cmd_base = (mode == 0) ? 0 : 1;
+    if (!buf || !cmd || cmd_len == 0 || (size_t)(cmd_base + cmd_len) > report_len) {
+        return false;
+    }
+
+    ZeroMemory(buf, report_len);
+    if (cmd_base == 1) {
+        buf[0] = 0x00;
+    }
+    memcpy(buf + cmd_base, cmd, cmd_len);
+    return true;
+}
+
+static int match_feature_response(const uint8_t *buf, size_t report_len, const uint8_t *cmd, size_t cmd_len) {
+    if (!buf || !cmd || cmd_len == 0) {
+        return -1;
+    }
+    if (report_len >= cmd_len && memcmp(buf, cmd, cmd_len) == 0) {
+        return 0;
+    }
+    if (report_len >= cmd_len + 1 && buf[0] == 0x00 && memcmp(buf + 1, cmd, cmd_len) == 0) {
+        return 1;
+    }
+    return -1;
+}
+
+static int match_ack_response(const uint8_t *buf, size_t report_len, uint8_t ack_value) {
+    if (!buf || report_len < 3) {
+        return -1;
+    }
+    if (buf[0] == 0x54 && buf[1] == 0xE4 && buf[2] == ack_value) {
+        return 0;
+    }
+    if (report_len >= 4 && buf[0] == 0x00 && buf[1] == 0x54 && buf[2] == 0xE4 && buf[3] == ack_value) {
+        return 1;
+    }
+    return -1;
+}
+
+static int match_ack_response_min(const uint8_t *buf, size_t report_len, uint8_t min_ack_value) {
+    if (!buf || report_len < 3) {
+        return -1;
+    }
+    if (buf[0] == 0x54 && buf[1] == 0xE4 && buf[2] >= min_ack_value) {
+        return 0;
+    }
+    if (report_len >= 4 && buf[0] == 0x00 && buf[1] == 0x54 && buf[2] == 0xE4 && buf[3] >= min_ack_value) {
+        return 1;
+    }
+    return -1;
+}
+
+static bool exchange_feature_command(
+    HANDLE handle,
+    uint8_t *buf,
+    size_t report_len,
+    int mode,
+    const uint8_t *cmd,
+    size_t cmd_len,
+    wchar_t *reason,
+    size_t reason_count) {
+    if (!prepare_feature_command(buf, report_len, mode, cmd, cmd_len)) {
+        if (reason && reason_count > 0) {
+            format_wstr(reason, reason_count, L"prepare command failed (len=%u, mode=%d)", (unsigned)report_len, mode);
+        }
+        return false;
+    }
+
+    if (!HidD_SetFeature(handle, buf, (ULONG)report_len)) {
+        if (reason && reason_count > 0) {
+            format_wstr(reason, reason_count, L"HidD_SetFeature failed (GLE=%lu, len=%u, mode=%d)", GetLastError(), (unsigned)report_len, mode);
+        }
+        return false;
+    }
+
+    Sleep(FEATURE_EXCHANGE_DELAY_MS);
+
+    for (int attempt = 0; attempt < FEATURE_POLL_ATTEMPTS; ++attempt) {
+        DWORD hid_get_err = 0;
+        DWORD ioctl_err = 0;
+
+        prepare_feature_command(buf, report_len, mode, cmd, cmd_len);
+        if (!HidD_GetFeature(handle, buf, (ULONG)report_len)) {
+            hid_get_err = GetLastError();
+            prepare_feature_command(buf, report_len, mode, cmd, cmd_len);
+            if (!get_feature_report_timeout(handle, buf, (DWORD)report_len, FEATURE_POLL_TIMEOUT_MS)) {
+                ioctl_err = GetLastError();
+                if (attempt + 1 < FEATURE_POLL_ATTEMPTS) {
+                    Sleep(FEATURE_EXCHANGE_DELAY_MS);
+                    continue;
+                }
+                if (reason && reason_count > 0) {
+                    format_wstr(
+                        reason,
+                        reason_count,
+                        L"GetFeature failed (HidD GLE=%lu, IOCTL GLE=%lu, len=%u, mode=%d)",
+                        hid_get_err,
+                        ioctl_err,
+                        (unsigned)report_len,
+                        mode);
+                }
+                return false;
+            }
+        }
+
+        if (match_feature_response(buf, report_len, cmd, cmd_len) >= 0) {
+            return true;
+        }
+
+        Sleep(FEATURE_EXCHANGE_DELAY_MS);
+    }
+
+    if (reason && reason_count > 0) {
+        format_wstr(
+            reason,
+            reason_count,
+            L"unexpected report: len=%u mode=%d h=%02X %02X %02X",
+            (unsigned)report_len,
+            mode,
+            (unsigned)buf[0],
+            (unsigned)(report_len > 1 ? buf[1] : 0),
+            (unsigned)(report_len > 2 ? buf[2] : 0));
+    }
+    return false;
+}
+
+static bool exchange_feature_ack_min(
+    HANDLE handle,
+    uint8_t *buf,
+    size_t report_len,
+    int mode,
+    const uint8_t *cmd,
+    size_t cmd_len,
+    uint8_t min_ack_value,
+    wchar_t *reason,
+    size_t reason_count) {
+    if (!prepare_feature_command(buf, report_len, mode, cmd, cmd_len)) {
+        return false;
+    }
+    if (!HidD_SetFeature(handle, buf, (ULONG)report_len)) {
+        return false;
+    }
+
+    Sleep(FEATURE_EXCHANGE_DELAY_MS);
+
+    for (int attempt = 0; attempt < FEATURE_POLL_ATTEMPTS; ++attempt) {
+        prepare_feature_command(buf, report_len, mode, cmd, cmd_len);
+        if (!HidD_GetFeature(handle, buf, (ULONG)report_len)) {
+            prepare_feature_command(buf, report_len, mode, cmd, cmd_len);
+            if (!get_feature_report_timeout(handle, buf, (DWORD)report_len, FEATURE_POLL_TIMEOUT_MS)) {
+                Sleep(FEATURE_EXCHANGE_DELAY_MS);
+                continue;
+            }
+        }
+
+        if (match_ack_response_min(buf, report_len, min_ack_value) >= 0) {
+            return true;
+        }
+        Sleep(FEATURE_EXCHANGE_DELAY_MS);
+    }
+
+    if (reason && reason_count > 0) {
+        format_wstr(reason, reason_count, L"ack-min failed: h=%02X %02X %02X", (unsigned)buf[0], (unsigned)(report_len > 1 ? buf[1] : 0), (unsigned)(report_len > 2 ? buf[2] : 0));
+    }
+    return false;
+}
+
+static bool exchange_feature_ack_exact(
+    HANDLE handle,
+    uint8_t *buf,
+    size_t report_len,
+    int mode,
+    const uint8_t *cmd,
+    size_t cmd_len,
+    uint8_t ack_value,
+    wchar_t *reason,
+    size_t reason_count) {
+    if (!prepare_feature_command(buf, report_len, mode, cmd, cmd_len)) {
+        return false;
+    }
+    if (!HidD_SetFeature(handle, buf, (ULONG)report_len)) {
+        return false;
+    }
+
+    Sleep(FEATURE_EXCHANGE_DELAY_MS);
+
+    for (int attempt = 0; attempt < FEATURE_POLL_ATTEMPTS; ++attempt) {
+        prepare_feature_command(buf, report_len, mode, cmd, cmd_len);
+        if (!HidD_GetFeature(handle, buf, (ULONG)report_len)) {
+            prepare_feature_command(buf, report_len, mode, cmd, cmd_len);
+            if (!get_feature_report_timeout(handle, buf, (DWORD)report_len, FEATURE_POLL_TIMEOUT_MS)) {
+                Sleep(FEATURE_EXCHANGE_DELAY_MS);
+                continue;
+            }
+        }
+
+        if (match_ack_response(buf, report_len, ack_value) >= 0) {
+            return true;
+        }
+        Sleep(FEATURE_EXCHANGE_DELAY_MS);
+    }
+
+    if (reason && reason_count > 0) {
+        format_wstr(reason, reason_count, L"ack-exact failed: h=%02X %02X %02X", (unsigned)buf[0], (unsigned)(report_len > 1 ? buf[1] : 0), (unsigned)(report_len > 2 ? buf[2] : 0));
+    }
+    return false;
+}
+
 static bool query_endpoint_battery(const Endpoint *ep, BatteryState *state, wchar_t *reason, size_t reason_count) {
     if (reason && reason_count > 0) {
         reason[0] = L'\0';
@@ -524,6 +759,8 @@ static bool query_endpoint_battery(const Endpoint *ep, BatteryState *state, wcha
         }
         return false;
     }
+
+    Sleep(OPEN_SETTLE_DELAY_MS);
 
     size_t len_candidates[3];
     size_t len_count = 0;
@@ -550,85 +787,28 @@ static bool query_endpoint_battery(const Endpoint *ep, BatteryState *state, wcha
         }
         return false;
     }
+    static const uint8_t battery_cmd[2] = {0x51, 0x06};
+    static const uint8_t wake_cmd[2] = {0x51, 0x07};
+    static const uint8_t prepare_24g_cmd[4] = {0x51, 0x0C, 0x02, 0x11};
+
     for (size_t i = 0; i < len_count; ++i) {
         size_t report_len = len_candidates[i];
         for (int mode = 0; mode < 2; ++mode) {
-            DWORD set_err = 0;
-            DWORD hid_get_err = 0;
-            DWORD ioctl_err = 0;
             int cmd_base = (mode == 0) ? 0 : 1;
 
             if ((size_t)(cmd_base + 12) >= report_len) {
                 continue;
             }
 
-            ZeroMemory(buf, report_len);
-            if (cmd_base == 0) {
-                buf[0] = 0x51;
-                buf[1] = 0x06;
-            } else {
-                buf[0] = 0x00;
-                buf[1] = 0x51;
-                buf[2] = 0x06;
-            }
-            if (!HidD_SetFeature(handle, buf, (ULONG)report_len)) {
-                set_err = GetLastError();
-                if (reason && reason_count > 0) {
-                    format_wstr(
-                        reason,
-                        reason_count,
-                        L"HidD_SetFeature failed (GLE=%lu, len=%u, mode=%d)",
-                        set_err,
-                        (unsigned)report_len,
-                        mode);
-                }
+            exchange_feature_ack_min(handle, buf, report_len, mode, prepare_24g_cmd, ARRAYSIZE(prepare_24g_cmd), 2, NULL, 0);
+            exchange_feature_command(handle, buf, report_len, mode, battery_cmd, ARRAYSIZE(battery_cmd), NULL, 0);
+            exchange_feature_ack_exact(handle, buf, report_len, mode, wake_cmd, ARRAYSIZE(wake_cmd), 1, NULL, 0);
+            if (!exchange_feature_command(handle, buf, report_len, mode, battery_cmd, ARRAYSIZE(battery_cmd), reason, reason_count)) {
                 continue;
             }
 
-            Sleep(12);
-
-            ZeroMemory(buf, report_len);
-            if (cmd_base == 0) {
-                buf[0] = 0x51;
-                buf[1] = 0x06;
-            } else {
-                buf[0] = 0x00;
-                buf[1] = 0x51;
-                buf[2] = 0x06;
-            }
-            if (!HidD_GetFeature(handle, buf, (ULONG)report_len)) {
-                hid_get_err = GetLastError();
-                ZeroMemory(buf, report_len);
-                if (cmd_base == 0) {
-                    buf[0] = 0x51;
-                    buf[1] = 0x06;
-                } else {
-                    buf[0] = 0x00;
-                    buf[1] = 0x51;
-                    buf[2] = 0x06;
-                }
-                if (!get_feature_report_timeout(handle, buf, (DWORD)report_len, 1500)) {
-                    ioctl_err = GetLastError();
-                    if (reason && reason_count > 0) {
-                        format_wstr(
-                            reason,
-                            reason_count,
-                            L"GetFeature failed (HidD GLE=%lu, IOCTL GLE=%lu, len=%u, mode=%d)",
-                            hid_get_err,
-                            ioctl_err,
-                            (unsigned)report_len,
-                            mode);
-                    }
-                    continue;
-                }
-            }
-
             int data_base = -1;
-            if (report_len > 12 && buf[0] == 0x51 && buf[1] == 0x06) {
-                data_base = 0;
-            } else if (report_len > 13 && buf[1] == 0x51 && buf[2] == 0x06) {
-                data_base = 1;
-            }
+            data_base = match_feature_response(buf, report_len, battery_cmd, ARRAYSIZE(battery_cmd));
 
             if (data_base < 0 || buf[data_base + 11] > 100) {
                 if (reason && reason_count > 0) {
@@ -668,6 +848,34 @@ static bool query_keychron_battery(const wchar_t *config_path, BatteryState *sta
     Endpoint endpoints[32];
     wchar_t last_reason[256];
     last_reason[0] = L'\0';
+
+    {
+        size_t known_count = load_known_interfaces(config_path, known, ARRAYSIZE(known));
+        for (int attempt = 0; attempt < QUERY_RETRY_COUNT; ++attempt) {
+            size_t endpoint_count = enumerate_endpoints(known, known_count, endpoints, ARRAYSIZE(endpoints));
+            if (endpoint_count == 0) {
+                copy_wstr(last_reason, ARRAYSIZE(last_reason), L"未找到 Keychron 2.4G HID 电量接口");
+            } else {
+                for (size_t i = 0; i < endpoint_count; ++i) {
+                    if (query_endpoint_battery(&endpoints[i], state, last_reason, ARRAYSIZE(last_reason))) {
+                        format_wstr(status, status_count, L"OK: VID=%04X PID=%04X", endpoints[i].vendor_id, endpoints[i].product_id);
+                        return true;
+                    }
+                }
+            }
+
+            if (attempt + 1 < QUERY_RETRY_COUNT) {
+                Sleep(QUERY_RETRY_DELAY_MS);
+            }
+        }
+
+        if (last_reason[0]) {
+            format_wstr(status, status_count, L"读取 0x51 0x06 失败: %ls", last_reason);
+        } else {
+            copy_wstr(status, status_count, L"读取 0x51 0x06 电量失败");
+        }
+        return false;
+    }
 
     size_t known_count = load_known_interfaces(config_path, known, ARRAYSIZE(known));
     size_t endpoint_count = enumerate_endpoints(known, known_count, endpoints, ARRAYSIZE(endpoints));
@@ -831,25 +1039,86 @@ static void update_tray_icon(AppState *app) {
     app->icon_added = TRUE;
 }
 
-static void refresh_state(AppState *app) {
-    BatteryState battery;
-    wchar_t status[256];
-    ZeroMemory(&battery, sizeof(battery));
-    ZeroMemory(status, sizeof(status));
-
-    if (query_keychron_battery(app->config_path, &battery, status, ARRAYSIZE(status))) {
+static void apply_refresh_result(AppState *app, const RefreshResult *result) {
+    if (!app || !result) {
+        return;
+    }
+    if (result->success) {
         app->has_battery = TRUE;
-        app->battery = battery;
-        copy_wstr(app->status_text, ARRAYSIZE(app->status_text), status);
+        app->battery = result->battery;
+        copy_wstr(app->status_text, ARRAYSIZE(app->status_text), result->status);
     } else {
         app->has_battery = FALSE;
         ZeroMemory(&app->battery, sizeof(app->battery));
-        copy_wstr(app->status_text, ARRAYSIZE(app->status_text), status);
+        copy_wstr(app->status_text, ARRAYSIZE(app->status_text), result->status);
+    }
+    app->autostart_enabled = result->autostart_enabled;
+    update_tray_icon(app);
+}
+
+static void register_hid_notifications(AppState *app) {
+    if (!app || !app->hwnd || app->hid_notify) {
+        return;
     }
 
-    app->autostart_enabled = is_autostart_enabled();
+    GUID hid_guid;
+    DEV_BROADCAST_DEVICEINTERFACE_W filter;
+    HidD_GetHidGuid(&hid_guid);
 
-    update_tray_icon(app);
+    ZeroMemory(&filter, sizeof(filter));
+    filter.dbcc_size = sizeof(filter);
+    filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+    filter.dbcc_classguid = hid_guid;
+    app->hid_notify = RegisterDeviceNotificationW(app->hwnd, &filter, DEVICE_NOTIFY_WINDOW_HANDLE);
+}
+
+static DWORD WINAPI refresh_worker_thread(LPVOID param) {
+    AppState *app = (AppState *)param;
+    if (!app) {
+        return 0;
+    }
+
+    RefreshResult *result = (RefreshResult *)calloc(1, sizeof(*result));
+    if (!result) {
+        InterlockedExchange(&app->refresh_in_progress, 0);
+        return 0;
+    }
+
+    result->autostart_enabled = is_autostart_enabled();
+    result->success = query_keychron_battery(app->config_path, &result->battery, result->status, ARRAYSIZE(result->status)) ? TRUE : FALSE;
+
+    if (app->shutting_down || !app->hwnd || !PostMessageW(app->hwnd, WM_REFRESH_COMPLETE, 0, (LPARAM)result)) {
+        free(result);
+        InterlockedExchange(&app->refresh_in_progress, 0);
+    }
+    return 0;
+}
+
+static void start_refresh_async(AppState *app) {
+    if (!app || !app->hwnd || app->shutting_down) {
+        return;
+    }
+    if (InterlockedCompareExchange(&app->refresh_in_progress, 1, 0) != 0) {
+        app->refresh_pending = TRUE;
+        return;
+    }
+
+    HANDLE thread = CreateThread(NULL, 0, refresh_worker_thread, app, 0, NULL);
+    if (!thread) {
+        InterlockedExchange(&app->refresh_in_progress, 0);
+        return;
+    }
+    if (app->refresh_thread) {
+        CloseHandle(app->refresh_thread);
+    }
+    app->refresh_thread = thread;
+}
+
+static void request_refresh(AppState *app, UINT delay_ms) {
+    if (!app || !app->hwnd) {
+        return;
+    }
+    SetTimer(app->hwnd, TIMER_ID_DEFERRED_REFRESH, delay_ms ? delay_ms : DEFERRED_REFRESH_DELAY_MS, NULL);
 }
 
 static void show_context_menu(AppState *app) {
@@ -900,13 +1169,25 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             app = (AppState *)cs->lpCreateParams;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)app);
             app->hwnd = hwnd;
-            refresh_state(app);
+            register_hid_notifications(app);
+            copy_wstr(app->status_text, ARRAYSIZE(app->status_text), L"等待 Keychron 接收器就绪");
+            update_tray_icon(app);
+            SetTimer(hwnd, TIMER_ID_STARTUP_REFRESH, STARTUP_REFRESH_DELAY_MS, NULL);
             SetTimer(hwnd, TIMER_ID_REFRESH, app->refresh_ms, NULL);
             return 0;
         }
         case WM_TIMER:
-            if (app && wparam == TIMER_ID_REFRESH) {
-                refresh_state(app);
+            if (app && wparam == TIMER_ID_STARTUP_REFRESH) {
+                KillTimer(hwnd, TIMER_ID_STARTUP_REFRESH);
+                start_refresh_async(app);
+            } else if (app && wparam == TIMER_ID_DEVICECHANGE_REFRESH) {
+                KillTimer(hwnd, TIMER_ID_DEVICECHANGE_REFRESH);
+                start_refresh_async(app);
+            } else if (app && wparam == TIMER_ID_DEFERRED_REFRESH) {
+                KillTimer(hwnd, TIMER_ID_DEFERRED_REFRESH);
+                start_refresh_async(app);
+            } else if (app && wparam == TIMER_ID_REFRESH) {
+                start_refresh_async(app);
             }
             return 0;
         case WM_COMMAND:
@@ -918,10 +1199,10 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                     if (set_autostart_enabled(app->autostart_enabled ? false : true)) {
                         app->autostart_enabled = app->autostart_enabled ? FALSE : TRUE;
                     }
-                    refresh_state(app);
+                    request_refresh(app, DEFERRED_REFRESH_DELAY_MS);
                     return 0;
                 case MENU_ID_REFRESH:
-                    refresh_state(app);
+                    request_refresh(app, DEFERRED_REFRESH_DELAY_MS);
                     return 0;
                 case MENU_ID_EXIT:
                     DestroyWindow(hwnd);
@@ -934,12 +1215,37 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
                 return 0;
             }
             if (lparam == WM_LBUTTONUP || lparam == NIN_SELECT) {
-                refresh_state(app);
+                request_refresh(app, DEFERRED_REFRESH_DELAY_MS);
                 return 0;
             }
             if (lparam == WM_RBUTTONUP || lparam == WM_CONTEXTMENU) {
                 show_context_menu(app);
                 return 0;
+            }
+            return 0;
+        case WM_DEVICECHANGE:
+            if (!app) {
+                return 0;
+            }
+            if (wparam == DBT_DEVICEARRIVAL ||
+                wparam == DBT_DEVICEREMOVECOMPLETE ||
+                wparam == DBT_DEVNODES_CHANGED) {
+                SetTimer(hwnd, TIMER_ID_DEVICECHANGE_REFRESH, DEVICECHANGE_REFRESH_DELAY_MS, NULL);
+            }
+            return 0;
+        case WM_REFRESH_COMPLETE:
+            if (!app) {
+                return 0;
+            }
+            if (lparam) {
+                RefreshResult *result = (RefreshResult *)lparam;
+                apply_refresh_result(app, result);
+                free(result);
+            }
+            InterlockedExchange(&app->refresh_in_progress, 0);
+            if (app->refresh_pending && !app->shutting_down) {
+                app->refresh_pending = FALSE;
+                request_refresh(app, DEFERRED_REFRESH_DELAY_MS);
             }
             return 0;
         case WM_MEASUREITEM: {
@@ -960,7 +1266,20 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         }
         case WM_DESTROY:
             if (app) {
+                app->shutting_down = TRUE;
                 KillTimer(hwnd, TIMER_ID_REFRESH);
+                KillTimer(hwnd, TIMER_ID_STARTUP_REFRESH);
+                KillTimer(hwnd, TIMER_ID_DEVICECHANGE_REFRESH);
+                KillTimer(hwnd, TIMER_ID_DEFERRED_REFRESH);
+                if (app->refresh_thread) {
+                    WaitForSingleObject(app->refresh_thread, 1000);
+                    CloseHandle(app->refresh_thread);
+                    app->refresh_thread = NULL;
+                }
+                if (app->hid_notify) {
+                    UnregisterDeviceNotification(app->hid_notify);
+                    app->hid_notify = NULL;
+                }
                 if (app->icon_added) {
                     Shell_NotifyIconW(NIM_DELETE, &app->nid);
                     app->icon_added = FALSE;
