@@ -1,6 +1,7 @@
 #define _WIN32_WINNT 0x0A00
 #include <windows.h>
 #include <dbt.h>
+#include <cfgmgr32.h>
 #include <setupapi.h>
 #include <hidsdi.h>
 #include <shellapi.h>
@@ -499,6 +500,171 @@ static size_t enumerate_endpoints(const KnownInterface *known, size_t known_coun
     return count;
 }
 
+static bool open_device_info_for_path(const wchar_t *device_path, HDEVINFO *devs_out, SP_DEVINFO_DATA *devinfo_out) {
+    if (!device_path || !device_path[0] || !devs_out || !devinfo_out) {
+        return false;
+    }
+
+    GUID hid_guid;
+    HidD_GetHidGuid(&hid_guid);
+
+    HDEVINFO devs = SetupDiGetClassDevsW(&hid_guid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (devs == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    bool found = false;
+    for (DWORD index = 0;; ++index) {
+        SP_DEVICE_INTERFACE_DATA iface = {0};
+        iface.cbSize = sizeof(iface);
+        if (!SetupDiEnumDeviceInterfaces(devs, NULL, &hid_guid, index, &iface)) {
+            if (GetLastError() == ERROR_NO_MORE_ITEMS) {
+                break;
+            }
+            continue;
+        }
+
+        DWORD needed = 0;
+        SP_DEVINFO_DATA devinfo = {0};
+        devinfo.cbSize = sizeof(devinfo);
+        SetupDiGetDeviceInterfaceDetailW(devs, &iface, NULL, 0, &needed, &devinfo);
+        if (!needed) {
+            continue;
+        }
+
+        PSP_DEVICE_INTERFACE_DETAIL_DATA_W detail = (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)calloc(1, needed);
+        if (!detail) {
+            continue;
+        }
+
+        detail->cbSize = sizeof(*detail);
+        devinfo.cbSize = sizeof(devinfo);
+        if (SetupDiGetDeviceInterfaceDetailW(devs, &iface, detail, needed, NULL, &devinfo) &&
+            _wcsicmp(detail->DevicePath, device_path) == 0) {
+            *devs_out = devs;
+            *devinfo_out = devinfo;
+            found = true;
+            free(detail);
+            break;
+        }
+
+        free(detail);
+    }
+
+    if (!found) {
+        SetupDiDestroyDeviceInfoList(devs);
+    }
+    return found;
+}
+
+static bool find_device_instance_for_path(const wchar_t *device_path, DEVINST *devinst) {
+    if (!device_path || !device_path[0] || !devinst) {
+        return false;
+    }
+
+    HDEVINFO devs = INVALID_HANDLE_VALUE;
+    SP_DEVINFO_DATA devinfo = {0};
+    if (!open_device_info_for_path(device_path, &devs, &devinfo)) {
+        return false;
+    }
+    *devinst = devinfo.DevInst;
+    SetupDiDestroyDeviceInfoList(devs);
+    return true;
+}
+
+static bool reenumerate_endpoint_device(const wchar_t *device_path, wchar_t *reason, size_t reason_count) {
+    DEVINST devinst = 0;
+    if (!find_device_instance_for_path(device_path, &devinst)) {
+        if (reason && reason_count > 0) {
+            copy_wstr(reason, reason_count, L"未找到 HID devnode");
+        }
+        return false;
+    }
+
+    CONFIGRET cr = CM_Reenumerate_DevNode(devinst, CM_REENUMERATE_SYNCHRONOUS);
+    if (cr == CR_SUCCESS) {
+        if (reason && reason_count > 0) {
+            copy_wstr(reason, reason_count, L"已重新枚举 HID devnode");
+        }
+        return true;
+    }
+
+    DEVINST parent = 0;
+    if (CM_Get_Parent(&parent, devinst, 0) == CR_SUCCESS) {
+        cr = CM_Reenumerate_DevNode(parent, CM_REENUMERATE_SYNCHRONOUS);
+        if (cr == CR_SUCCESS) {
+            if (reason && reason_count > 0) {
+                copy_wstr(reason, reason_count, L"已重新枚举上级 devnode");
+            }
+            return true;
+        }
+    }
+
+    if (reason && reason_count > 0) {
+        format_wstr(reason, reason_count, L"CM_Reenumerate_DevNode failed (CR=%lu)", (unsigned long)cr);
+    }
+    return false;
+}
+
+static bool change_device_state(HDEVINFO devs, SP_DEVINFO_DATA *devinfo, DWORD state_change, wchar_t *reason, size_t reason_count) {
+    SP_PROPCHANGE_PARAMS params;
+    ZeroMemory(&params, sizeof(params));
+    params.ClassInstallHeader.cbSize = sizeof(params.ClassInstallHeader);
+    params.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
+    params.StateChange = state_change;
+    params.Scope = DICS_FLAG_GLOBAL;
+    params.HwProfile = 0;
+
+    if (!SetupDiSetClassInstallParamsW(devs, devinfo, &params.ClassInstallHeader, sizeof(params))) {
+        if (reason && reason_count > 0) {
+            format_wstr(reason, reason_count, L"SetClassInstallParams failed (GLE=%lu)", GetLastError());
+        }
+        return false;
+    }
+
+    if (!SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, devs, devinfo)) {
+        if (reason && reason_count > 0) {
+            format_wstr(reason, reason_count, L"CallClassInstaller failed (GLE=%lu)", GetLastError());
+        }
+        return false;
+    }
+
+    return true;
+}
+
+static bool restart_endpoint_device(const wchar_t *device_path, wchar_t *reason, size_t reason_count) {
+    HDEVINFO devs = INVALID_HANDLE_VALUE;
+    SP_DEVINFO_DATA devinfo = {0};
+    if (!open_device_info_for_path(device_path, &devs, &devinfo)) {
+        if (reason && reason_count > 0) {
+            copy_wstr(reason, reason_count, L"未找到 HID 设备信息");
+        }
+        return false;
+    }
+
+    bool ok = false;
+    wchar_t local_reason[256];
+    local_reason[0] = L'\0';
+
+    if (change_device_state(devs, &devinfo, DICS_DISABLE, local_reason, ARRAYSIZE(local_reason))) {
+        Sleep(300);
+        if (change_device_state(devs, &devinfo, DICS_ENABLE, local_reason, ARRAYSIZE(local_reason))) {
+            ok = true;
+        }
+    }
+
+    SetupDiDestroyDeviceInfoList(devs);
+
+    if (reason && reason_count > 0) {
+        if (ok) {
+            copy_wstr(reason, reason_count, L"已禁用并重新启用 HID 设备");
+        } else if (local_reason[0]) {
+            copy_wstr(reason, reason_count, local_reason);
+        }
+    }
+    return ok;
+}
+
 static bool get_feature_report_timeout(HANDLE handle, uint8_t *buf, DWORD len, DWORD timeout_ms) {
     OVERLAPPED ov = {0};
     ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
@@ -847,7 +1013,11 @@ static bool query_keychron_battery(const wchar_t *config_path, BatteryState *sta
     KnownInterface known[64];
     Endpoint endpoints[32];
     wchar_t last_reason[256];
+    wchar_t reenum_reason[256];
+    wchar_t restart_reason[256];
     last_reason[0] = L'\0';
+    reenum_reason[0] = L'\0';
+    restart_reason[0] = L'\0';
 
     {
         size_t known_count = load_known_interfaces(config_path, known, ARRAYSIZE(known));
@@ -864,13 +1034,39 @@ static bool query_keychron_battery(const wchar_t *config_path, BatteryState *sta
                 }
             }
 
+            if (attempt == 0 && endpoint_count > 0) {
+                bool reenumerated = false;
+                for (size_t i = 0; i < endpoint_count; ++i) {
+                    if (reenumerate_endpoint_device(endpoints[i].path, reenum_reason, ARRAYSIZE(reenum_reason))) {
+                        reenumerated = true;
+                        break;
+                    }
+                }
+                if (reenumerated) {
+                    Sleep(400);
+                } else {
+                    for (size_t i = 0; i < endpoint_count; ++i) {
+                        if (restart_endpoint_device(endpoints[i].path, restart_reason, ARRAYSIZE(restart_reason))) {
+                            Sleep(1200);
+                            break;
+                        }
+                    }
+                }
+            }
+
             if (attempt + 1 < QUERY_RETRY_COUNT) {
                 Sleep(QUERY_RETRY_DELAY_MS);
             }
         }
 
         if (last_reason[0]) {
-            format_wstr(status, status_count, L"读取 0x51 0x06 失败: %ls", last_reason);
+            if (restart_reason[0]) {
+                format_wstr(status, status_count, L"读取失败: %ls; 设备重启: %ls", last_reason, restart_reason);
+            } else if (reenum_reason[0]) {
+                format_wstr(status, status_count, L"读取失败: %ls; 重枚举: %ls", last_reason, reenum_reason);
+            } else {
+                format_wstr(status, status_count, L"读取 0x51 0x06 失败: %ls", last_reason);
+            }
         } else {
             copy_wstr(status, status_count, L"读取 0x51 0x06 电量失败");
         }

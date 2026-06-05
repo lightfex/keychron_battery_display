@@ -1,6 +1,6 @@
 CC := gcc
 CFLAGS := -std=c11 -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -finput-charset=UTF-8 -municode
-LIBS := -lsetupapi -lhid -lshell32 -lgdi32
+LIBS := -lsetupapi -lhid -lshell32 -lgdi32 -lcfgmgr32
 
 SRC := keychron_battery_display.c
 TARGET := keychron_battery_display.exe
